@@ -1,89 +1,121 @@
 # crnt-verify
 
-**A deterministic solver *and* a deterministic grader for Chemical Reaction Network invariants.**
+**An RL environment and deterministic verifier for chemical reaction network invariants.**
 
-Given a set of species and reactions, `crnt-verify` computes the three canonical reaction invariants — **conservation laws**, **flux balance**, and **mass-action steady states** — using exact rational linear algebra (no floats, no sampling, no approximation). It also ships a `check_prediction()` function that grades *any* candidate answer to these problems — from a student, a script, or an LLM — by testing genuine mathematical equivalence rather than string matching.
+Generates reaction-network problems on demand, and grades answers by testing
+genuine **mathematical equivalence** rather than string matching — because a
+correct answer to these problems can be rescaled, reordered, or algebraically
+rearranged and still be correct.
 
 ```python
-["conservation laws", "steady states", "flux balance"]
-    = ["[A]+[B]+[C]=const",
-       "[A]*=T·k2·k3/(k1k2+k1k3+k2k3), ...",
-       "v1=v2=v3"]
+from crnt_gym import CRNTVerifyEnv
+
+env = CRNTVerifyEnv(difficulty=3, reward_mode="binary")
+observation, info = env.reset(seed=42)          # a fresh reaction network
+observation, reward, terminated, truncated, info = env.step(model_output)
 ```
 
-## Why a *grader*, not just a solver
+Gymnasium-style `reset` / `step` / `reward`, so it plugs into an RL training
+loop or an eval harness directly. A Prime Intellect `verifiers` adapter is
+included (`crnt_verifiers_env.py`).
 
-Conservation laws and flux-balance modes are only defined **up to a choice of basis and a scalar multiple** — `2[A]+2[B]+2[C]=const` is exactly as correct as `[A]+[B]+[C]=const`. Steady-state expressions are only defined **up to algebraic rearrangement**. That means the obvious way to check an answer — compare it to a reference string — fails on correct answers that are simply written differently, which is precisely the failure mode you hit the moment you try to auto-grade an LLM's output on problems like this.
+---
 
-`check_prediction(pred, expected) -> bool` handles it with two different equivalence tests, chosen by what kind of object is being compared:
+## Why equivalence testing, not string matching
 
-| Invariant | What it really is | Equivalence test |
+Conservation laws and flux-balance modes are **bases of a subspace** — any
+nonzero scalar multiple or basis recombination is equally correct. Steady
+states are algebraic expressions, correct up to rearrangement. Comparing text
+therefore fails on correct answers, which is exactly the failure mode that
+poisons a reward signal.
+
+| Invariant | Underlying object | Equivalence test |
 |---|---|---|
-| Conservation laws | A basis of $\ker(S^T)$ | **Subspace equality** via rank: $\operatorname{rank}(M_{pred}) = \operatorname{rank}(M_{exp}) = \operatorname{rank}(M_{pred} \Vert M_{exp})$ |
-| Flux balance | A basis of $\ker(S)$ | Same subspace-equality test, applied to the null space |
-| Steady states | Algebraic expressions in rate constants | **Deterministic randomized-substitution equivalence** — evaluate the symbolic difference at fixed-seed rational test points |
+| Conservation laws | basis of ker(S^T) | **subspace equality by rank**: rank(P) = rank(E) = rank(P‖E) |
+| Flux balance | basis of ker(S) | same rank test |
+| Steady states | algebraic expressions | **deterministic randomized substitution** at fixed-seed rational points |
 
-Binary output, fixed seed, no LLM-as-judge, no partial credit for "close enough." This same pattern — turn "is this mathematically the same answer, however it's written" into a cheap, deterministic, binary check — is exactly the kind of verifier that reward pipelines for reasoning-focused LLM training (RLVR) run millions of times per training run. This repo is a small, self-contained example of that pattern applied to a real scientific domain.
+Binary verdict, fixed seed, no LLM-as-judge. This is the verifier pattern that
+reinforcement learning with verifiable rewards (RLVR) depends on, applied to a
+real scientific domain.
 
-## What's inside
+**It works on real model output.** In live evaluation a model answered flux
+balance as three redundant pairwise equations (`v1=v2`, `v2=v3`, `v1=v3`)
+instead of the key's single chain — correctly accepted as the same subspace.
+Another gave conservation laws in a different basis whose recombination
+reproduced the key — also accepted.
 
-```
-crnt_solver.py    # builds S, computes ker(S^T), ker(S), deficiency, mass-action steady states
-crnt_checker.py   # check_prediction(pred, expected) -> bool
-```
+---
 
-### `crnt_solver.py`
+## Measured result
 
-```python
-from crnt_solver import ReactionNetwork, Reaction, solve_network
-import sympy as sp
+**gemini-3.5-flash-lite, difficulty 3, n=20: 15% (3/20)**, 95% CI 5–36%.
+Zero API errors, zero unparseable responses.
 
-species = ["A", "B", "C"]
-reactions = [
-    Reaction("1", reactants={"A": 1}, products={"B": 1}, k=sp.Symbol("k1", positive=True)),
-    Reaction("2", reactants={"B": 1}, products={"C": 1}, k=sp.Symbol("k2", positive=True)),
-    Reaction("3", reactants={"C": 1}, products={"A": 1}, k=sp.Symbol("k3", positive=True)),
-]
-net = ReactionNetwork(species=species, reactions=reactions)
-result = solve_network(net)
-```
+Broken down by sub-problem:
 
-For this catalytic cycle $A \to B \to C \to A$: rank$(S)=2$, deficiency $\delta = 3-1-2=0$ (Deficiency Zero Theorem applies — a unique, locally stable steady state is guaranteed for *any* choice of positive rate constants), and the solver returns:
+| Sub-check | Pass rate |
+|---|---|
+| Conservation laws (linear) | 60% |
+| Flux balance (linear) | 65% |
+| **Steady states (nonlinear)** | **15%** |
 
-- **Conservation law:** $[A]+[B]+[C]=\text{const}$
-- **Flux balance:** $v_1=v_2=v_3$
-- **Steady state:** $[A]^* = \dfrac{T\,k_2k_3}{k_1k_2+k_1k_3+k_2k_3}$ (and cyclic permutations)
+The two linear sub-problems cluster together; the nonlinear one collapses.
+That gradient matches the mathematics and was not designed for. Failures were
+verified independently — the model's claimed conservation laws give
+`c^T S ≠ 0` — so this is genuine model error, not a grader artifact.
 
-### `crnt_checker.py`
+Full detail, including the defects found and fixed along the way, in
+[RESULTS.md](RESULTS.md).
 
-```python
-from crnt_checker import check_prediction
+---
 
-expected = {...}   # reference answer, same shape as solve_network()'s output
-pred     = {...}   # candidate answer — could be scaled, reordered, differently written
-
-check_prediction(pred, expected)   # -> True / False
-```
-
-Run `python crnt_checker.py` to see the self-test suite: exact match, a rewritten-but-equivalent answer (scaled laws, re-chained flux equalities, reshuffled fractions), a wrong coefficient, a wrong steady state, and a missing category — the grader passes the first two and fails the rest, as it should.
-
-## Install
+## Quick start
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt        # sympy only
+py demo.py                             # narrated walkthrough, no API key needed
+py crnt_gym.py                         # environment self-tests
+py evaluate.py --n 20 --provider google --model <model> --delay 4 --save run.json
+py inspect_results.py --file run.json --only-failures
 ```
 
-No other dependencies — pure Python + sympy.
+Providers supported: `anthropic`, `google`, `groq`, `openrouter`, and
+`manual` (paste answers by hand — no key, no cost). See
+[QUICKSTART.md](QUICKSTART.md) for step-by-step setup.
 
-## Limitations (honestly stated)
+## Files
 
-- `crnt_solver.py` uses `sympy.solve` for the polynomial steady-state system, which is fine for small networks but won't scale to large or multistationary ones — a real production tool would need Gröbner bases or numerical continuation (see the [mantis-delta](https://www.biorxiv.org/content/10.64898/2026.05.14.725189v1) project for a much more complete solver).
-- `check_prediction` assumes rate-constant/parameter names match by literal string between `pred` and `expected` — it can't infer that two differently-named symbols mean the same physical quantity.
-- This is a portfolio-scale demonstration of a verification *pattern*, not a validated benchmark — no claim is made here about LLM accuracy on CRNT problems at scale.
+| File | Purpose |
+|---|---|
+| `crnt_solver.py` | computes ground truth (exact rational linear algebra) |
+| `crnt_checker.py` | `check_prediction(pred, expected) -> bool` — the grader |
+| `crnt_gym.py` | the environment: task generation, `reset`/`step`, reward |
+| `crnt_verifiers_env.py` | Prime Intellect `verifiers` adapter |
+| `demo.py` | narrated walkthrough |
+| `evaluate.py` | score a model, with retry/quota/error handling |
+| `inspect_results.py` | diagnose *why* answers failed, per sub-check |
+| `compare_models.py` | compare models on identical seeds |
+| `ENVIRONMENT_SPEC.md` | design rationale |
+| `RESULTS.md` | measured results, defect log, limitations |
+
+## Limitations
+
+Networks with more than one conservation law are excluded, because the steady
+state then depends on a non-unique choice of basis — the question is genuinely
+ill-posed, not merely underspecified. The conservation basis is also not
+saturated (Smith normal form would fix it; measured frequency of the problem
+on the current task distribution: 0 in 112 networks). Full list in
+[RESULTS.md](RESULTS.md).
 
 ## About
 
-Built by [Rigobert Fokam Souop](https://github.com/fokamrigobert), PhD candidate in Applied Mathematics (Cayley-graph embeddings of graphs, University of Ngaoundéré). The subspace-equality logic here — checking whether two differently-written objects are secretly the same one, via a canonical/quotient representation — is the same underlying idea as the Cocycle/Quotient Labeling Theorem in the author's dissertation, applied to a different domain.
+Built by [Rigobert Fokam Souop](https://github.com/fokamrigobert), PhD in
+Applied Mathematics (isometric graph embeddings into Cayley graphs of abelian
+groups, University of Ngaoundéré). The subspace-equality logic here —
+deciding whether two differently-written objects are secretly the same one via
+a canonical representation — is the same idea as the Cocycle/Quotient Labeling
+Theorem in the author's dissertation, applied to a different domain.
 
 ## License
 
